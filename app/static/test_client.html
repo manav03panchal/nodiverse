@@ -2,67 +2,121 @@
 <html>
 <head>
     <title>Nodiverse Test</title>
+    <script src="https://unpkg.com/react@17/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/force-graph"></script>
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
     <style>
+        .container {
+            display: flex;
+            height: 100vh;
+        }
+        .controls {
+            width: 300px;
+            padding: 20px;
+            border-right: 1px solid #ccc;
+        }
+        .graph {
+            flex: 1;
+        }
         .log {
-            border: 1px solid #ccc;
-            padding: 10px;
-            margin: 10px;
-            height: 300px;
+            height: 200px;
             overflow-y: scroll;
+            border: 1px solid #ccc;
+            margin-top: 20px;
+            padding: 10px;
         }
     </style>
 </head>
 <body>
-    <div>
-        <input type="text" id="userId" placeholder="Enter user ID">
-        <button onclick="connectUser()">Connect</button>
-        <button onclick="disconnect()">Disconnect</button>
-    </div>
-    <div class="log" id="messages"></div>
+    <div id="root"></div>
 
-    <script>
-        let ws = null;
-        
-        // Define log function first
-        function log(message) {
-            const messagesDiv = document.getElementById('messages');
-            const time = new Date().toLocaleTimeString();
-            messagesDiv.innerHTML += `<p>[${time}] ${message}</p>`;
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        }
-        
-        function connectUser() {
-            const userId = document.getElementById('userId').value;
-            const eventId = 'test-event';
-            
-            log('Attempting to connect...');
-            ws = new WebSocket(`ws://${window.location.hostname}:8000/ws/${eventId}/${userId}`);
-            
-            ws.onopen = () => {
-                log(`Connected as ${userId}`);
-            };
-            
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                log(`Received: ${JSON.stringify(data)}`);
-            };
-            
-            ws.onclose = (event) => {
-                log(`Disconnected. Code: ${event.code}, Reason: ${event.reason}`);
+    <script type="text/babel">
+        function App() {
+            const [userId, setUserId] = React.useState('');
+            const [ws, setWs] = React.useState(null);
+            const [graphData, setGraphData] = React.useState({
+                nodes: [],
+                links: []
+            });
+            const [logs, setLogs] = React.useState([]);
+            const graphRef = React.useRef(null);
+
+            React.useEffect(() => {
+                if (graphRef.current) {
+                    const Graph = ForceGraph()
+                        (graphRef.current)
+                        .graphData(graphData)
+                        .nodeColor(node => node.role === 'organizer' ? 'red' : 'blue')
+                        .nodeLabel(node => `${node.id} (${node.role})`)
+                        .width(800)
+                        .height(600);
+
+                    return () => Graph.pauseAnimation();
+                }
+            }, [graphData]);
+
+            const log = (message) => {
+                setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${message}`]);
             };
 
-            ws.onerror = (error) => {
-                log(`WebSocket Error: ${JSON.stringify(error)}`);
+            const connectUser = () => {
+                const eventId = '5f40798c-ed95-4b11-bcc3-5ab6b4a4badb'; // Your HackED event ID
+                const socket = new WebSocket(`ws://${window.location.hostname}:8000/ws/${eventId}/${userId}`);
+
+                socket.onopen = () => {
+                    log(`Connected as ${userId}`);
+                    setWs(socket);
+                };
+
+                socket.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    log(`Received: ${JSON.stringify(data)}`);
+
+                    if (data.type === 'initial_state') {
+                        const nodes = data.data.participants.map(p => ({
+                            id: p.id,
+                            role: p.role
+                        }));
+                        setGraphData({ nodes, links: [] });
+                    }
+                };
+
+                socket.onclose = () => {
+                    log('Disconnected');
+                    setWs(null);
+                };
             };
+
+            const disconnect = () => {
+                if (ws) {
+                    ws.close();
+                }
+            };
+
+            return (
+                <div className="container">
+                    <div className="controls">
+                        <input 
+                            type="text" 
+                            value={userId}
+                            onChange={(e) => setUserId(e.target.value)}
+                            placeholder="Enter user ID"
+                        />
+                        <button onClick={connectUser} disabled={ws}>Connect</button>
+                        <button onClick={disconnect} disabled={!ws}>Disconnect</button>
+                        <div className="log">
+                            {logs.map((log, i) => <div key={i}>{log}</div>)}
+                        </div>
+                    </div>
+                    <div className="graph">
+                        <div ref={graphRef}></div>
+                    </div>
+                </div>
+            );
         }
 
-        function disconnect() {
-            if (ws) {
-                ws.close();
-                ws = null;
-                log('Manually disconnected');
-            }
-        }
+        ReactDOM.render(<App />, document.getElementById('root'));
     </script>
 </body>
 </html>
