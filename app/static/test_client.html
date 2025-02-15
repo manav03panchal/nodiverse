@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Nodiverse Test</title>
+    <style>
+        .log {
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin: 10px;
+            height: 300px;
+            overflow-y: scroll;
+        }
+    </style>
+</head>
+<body>
+    <div>
+        <input type="text" id="userId" placeholder="Enter user ID">
+        <button onclick="connectUser()">Connect</button>
+        <button onclick="disconnect()">Disconnect</button>
+    </div>
+    <div class="log" id="messages"></div>
+
+    <script>
+        let ws = null;
+        
+        // Define log function first
+        function log(message) {
+            const messagesDiv = document.getElementById('messages');
+            const time = new Date().toLocaleTimeString();
+            messagesDiv.innerHTML += `<p>[${time}] ${message}</p>`;
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        function connectUser() {
+            const userId = document.getElementById('userId').value;
+            const eventId = 'test-event';
+            
+            log('Attempting to connect...');
+            ws = new WebSocket(`ws://${window.location.hostname}:8000/ws/${eventId}/${userId}`);
+            
+            ws.onopen = () => {
+                log(`Connected as ${userId}`);
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                log(`Received: ${JSON.stringify(data)}`);
+            };
+            
+            ws.onclose = (event) => {
+                log(`Disconnected. Code: ${event.code}, Reason: ${event.reason}`);
+            };
+
+            ws.onerror = (error) => {
+                log(`WebSocket Error: ${JSON.stringify(error)}`);
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+                log('Manually disconnected');
+            }
+        }
+    </script>
+</body>
+</html>
