@@ -23,58 +23,19 @@ app.add_middleware(
 
 
 @app.websocket("/ws/{event_id}/{user_id}")
-async def websocket_endpoint(
-    websocket: WebSocket, event_id: str, user_id: str, db: Session = Depends(get_db)
-):
+async def websocket_endpoint(websocket: WebSocket, event_id: str, user_id: str):
+    connected = await manager.connect(websocket, user_id, event_id)
+    if not connected:
+        await websocket.close(code=4004)
+        return
+
     try:
-        # Verify user and event exist
-        user = db.query(models.User).filter(models.User.id == user_id).first()
-        event = db.query(models.Event).filter(models.Event.id == event_id).first()
-
-        if not user or not event:
-            await websocket.close(code=4004)
-            return
-
-        # Get all current participants in event
-        participants = (
-            db.query(models.EventParticipant)
-            .filter(models.EventParticipant.event_id == event_id)
-            .all()
-        )
-
-        # Connect to WebSocket
-        await manager.connect(websocket, user_id, event_id)
-
-        # Send initial state
-        await websocket.send_json(
-            {
-                "type": "initial_state",
-                "data": {
-                    "current_user": {
-                        "id": user.id,
-                        "name": user.name,
-                        "role": user.role,
-                        "profile": user.profile,
-                    },
-                    "participants": [
-                        {
-                            "id": p.user_id,
-                            "role": p.role,
-                            # Add more participant info as needed
-                        }
-                        for p in participants
-                    ],
-                },
-            }
-        )
-
         while True:
             data = await websocket.receive_json()
             await manager.broadcast_to_event(
                 event_id,
                 {"type": data.get("type"), "data": data.get("data"), "sender": user_id},
             )
-
     except WebSocketDisconnect:
         await manager.disconnect(user_id, event_id)
 
@@ -127,9 +88,8 @@ def get_user(user_id: str, db: Session = Depends(get_db)):
     return user
 
 
-# Add event participant
 @app.post("/events/{event_id}/participants", response_model=schemas.EventParticipant)
-def add_participant(
+async def add_participant(
     event_id: str,
     participant: schemas.EventParticipantCreate,
     db: Session = Depends(get_db),
@@ -138,6 +98,25 @@ def add_participant(
     db.add(db_participant)
     db.commit()
     db.refresh(db_participant)
+
+    # Fetch the user details to send in the WebSocket broadcast
+    user = db.query(models.User).filter(models.User.id == participant.user_id).first()
+
+    if user:
+        # Notify all WebSocket clients about the new participant
+        await manager.broadcast_to_event(
+            event_id,
+            {
+                "type": "new_user",
+                "user": {
+                    "id": user.id,
+                    "name": user.name,
+                    "role": user.role,
+                    "profile": user.profile,
+                },
+            },
+        )
+
     return db_participant
 
 

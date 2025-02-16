@@ -1,0 +1,547 @@
+
+
+=== File: combined_file.txt ===
+
+
+
+=== File: main.py ===
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from app.websockets.connection_manager import ConnectionManager
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from .database.database import get_db
+from .models import models
+from .schemas import schemas
+import uuid
+
+app = FastAPI(title="Nodiverse")
+manager = ConnectionManager()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+# CORS setup for development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For development only
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.websocket("/ws/{event_id}/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, event_id: str, user_id: str):
+    connected = await manager.connect(websocket, user_id, event_id)
+    if not connected:
+        await websocket.close(code=4004)
+        return
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            await manager.broadcast_to_event(
+                event_id,
+                {"type": data.get("type"), "data": data.get("data"), "sender": user_id},
+            )
+    except WebSocketDisconnect:
+        await manager.disconnect(user_id, event_id)
+
+
+@app.post("/users/", response_model=schemas.User)
+def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    db_user = models.User(
+        id=str(uuid.uuid4()),
+        name=user.name,
+        email=user.email,
+        role=user.role,
+        profile=user.profile,
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+
+@app.post("/events/", response_model=schemas.Event)
+def create_event(event: schemas.EventCreate, db: Session = Depends(get_db)):
+    db_event = models.Event(
+        id=str(uuid.uuid4()),
+        name=event.name,
+        start_date=event.start_date,
+        end_date=event.end_date,
+        status=event.status,
+    )
+    db.add(db_event)
+    db.commit()
+    db.refresh(db_event)
+    return db_event
+
+
+@app.get("/users/", response_model=list[schemas.User])
+def get_users(db: Session = Depends(get_db)):
+    users = db.query(models.User).all()
+    return users
+
+
+@app.get("/events/", response_model=list[schemas.Event])
+def get_events(db: Session = Depends(get_db)):
+    events = db.query(models.Event).all()
+    return events
+
+
+@app.get("/users/{user_id}", response_model=schemas.User)
+def get_user(user_id: str, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    return user
+
+
+@app.post("/events/{event_id}/participants", response_model=schemas.EventParticipant)
+async def add_participant(
+    event_id: str,
+    participant: schemas.EventParticipantCreate,
+    db: Session = Depends(get_db),
+):
+    db_participant = models.EventParticipant(**participant.dict())
+    db.add(db_participant)
+    db.commit()
+    db.refresh(db_participant)
+
+    # Fetch the user details to send in the WebSocket broadcast
+    user = db.query(models.User).filter(models.User.id == participant.user_id).first()
+
+    if user:
+        # Notify all WebSocket clients about the new participant
+        await manager.broadcast_to_event(
+            event_id,
+            {
+                "type": "new_user",
+                "user": {
+                    "id": user.id,
+                    "name": user.name,
+                    "role": user.role,
+                    "profile": user.profile,
+                },
+            },
+        )
+
+    return db_participant
+
+
+@app.get("/test")
+async def test_page():
+    return FileResponse("static/test_client.html")
+
+
+=== File: __init__.py ===
+
+
+
+=== File: .env ===
+
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/nodiverse"
+
+
+=== File: models/__init__.py ===
+
+
+
+=== File: models/models.py ===
+
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON
+from sqlalchemy.sql import func
+from ..database.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    email = Column(String, unique=True)
+    role = Column(String)  # participant/mentor/organizer
+    profile = Column(JSON)  # flexible data like github, linkedin, etc
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Event(Base):
+    __tablename__ = "events"
+
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    start_date = Column(DateTime(timezone=True))
+    end_date = Column(DateTime(timezone=True))
+    status = Column(String)  # active/ended
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class EventParticipant(Base):
+    __tablename__ = "event_participants"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"))
+    event_id = Column(String, ForeignKey("events.id"))
+    role = Column(String)
+    joined_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Connection(Base):
+    __tablename__ = "connections"
+
+    id = Column(Integer, primary_key=True)
+    user_id_1 = Column(String, ForeignKey("users.id"))
+    user_id_2 = Column(String, ForeignKey("users.id"))
+    event_id = Column(String, ForeignKey("events.id"))
+    status = Column(String)  # pending/accepted
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+=== File: database/__init__.py ===
+
+
+
+=== File: database/database.py ===
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+
+
+# Dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+=== File: static/test_client.html ===
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Nodiverse Test</title>
+    <script src="https://unpkg.com/react@17/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/force-graph"></script>
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    <style>
+        .container {
+            display: flex;
+            height: 100vh;
+        }
+        .controls {
+            width: 300px;
+            padding: 20px;
+            border-right: 1px solid #ccc;
+        }
+        .graph {
+            flex: 1;
+        }
+        .log {
+            height: 200px;
+            overflow-y: scroll;
+            border: 1px solid #ccc;
+            margin-top: 20px;
+            padding: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        function App() {
+            const [userId, setUserId] = React.useState('');
+            const [ws, setWs] = React.useState(null);
+            const [graphData, setGraphData] = React.useState({
+                nodes: [],
+                links: []
+            });
+            const [logs, setLogs] = React.useState([]);
+            const graphRef = React.useRef(null);
+
+            React.useEffect(() => {
+                if (graphRef.current) {
+                    const Graph = ForceGraph()
+                        (graphRef.current)
+                        .graphData(graphData)
+                        .nodeColor(node => node.role === 'organizer' ? 'red' : 'blue')
+                        .nodeLabel(node => `${node.id} (${node.role})`)
+                        .width(800)
+                        .height(600);
+
+                    return () => Graph.pauseAnimation();
+                }
+            }, [graphData]);
+
+            const log = (message) => {
+                setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${message}`]);
+            };
+
+            const connectUser = () => {
+                const eventId = '5f40798c-ed95-4b11-bcc3-5ab6b4a4badb'; // Your HackED event ID
+                const socket = new WebSocket(`ws://${window.location.hostname}:8000/ws/${eventId}/${userId}`);
+
+                socket.onopen = () => {
+                    log(`Connected as ${userId}`);
+                    setWs(socket);
+                };
+
+                socket.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    log(`Received: ${JSON.stringify(data)}`);
+
+                    if (data.type === 'initial_state') {
+                        const nodes = data.data.participants.map(p => ({
+                            id: p.id,
+                            role: p.role
+                        }));
+                        setGraphData({ nodes, links: [] });
+                    }
+                };
+
+                socket.onclose = () => {
+                    log('Disconnected');
+                    setWs(null);
+                };
+            };
+
+            const disconnect = () => {
+                if (ws) {
+                    ws.close();
+                }
+            };
+
+            return (
+                <div className="container">
+                    <div className="controls">
+                        <input 
+                            type="text" 
+                            value={userId}
+                            onChange={(e) => setUserId(e.target.value)}
+                            placeholder="Enter user ID"
+                        />
+                        <button onClick={connectUser} disabled={ws}>Connect</button>
+                        <button onClick={disconnect} disabled={!ws}>Disconnect</button>
+                        <div className="log">
+                            {logs.map((log, i) => <div key={i}>{log}</div>)}
+                        </div>
+                    </div>
+                    <div className="graph">
+                        <div ref={graphRef}></div>
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
+
+
+=== File: websockets/__init__.py ===
+
+
+
+=== File: websockets/connection_manager.py ===
+
+from fastapi import WebSocket
+from typing import Dict, Set
+from app.database.database import SessionLocal
+from app.models import models
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.event_participants: Dict[str, Set[str]] = {}
+        print("Connection Manager initialized")  # Debug line
+
+    async def connect(self, websocket: WebSocket, user_id: str, event_id: str):
+        db = SessionLocal()  # Initialize db here, before try block
+
+        try:
+            # Verify user and event first
+            user = db.query(models.User).filter(models.User.id == user_id).first()
+            event = db.query(models.Event).filter(models.Event.id == event_id).first()
+
+            if not user or not event:
+                print(
+                    f"User or event not found: user={user is not None}, event={event is not None}"
+                )
+                return False
+
+            await websocket.accept()
+            self.active_connections[user_id] = websocket
+
+            if event_id not in self.event_participants:
+                self.event_participants[event_id] = set()
+            self.event_participants[event_id].add(user_id)
+
+            # Get current participants
+            participants = (
+                db.query(models.EventParticipant)
+                .filter(models.EventParticipant.event_id == event_id)
+                .all()
+            )
+
+            # Send initial state
+            await websocket.send_json(
+                {
+                    "type": "initial_state",
+                    "data": {
+                        "current_user": {
+                            "id": user.id,
+                            "name": user.name,
+                            "role": user.role,
+                            "profile": user.profile,
+                        },
+                        "participants": [
+                            {
+                                "id": p.user_id,
+                                "role": p.role,
+                            }
+                            for p in participants
+                        ],
+                    },
+                }
+            )
+
+            return True
+        except Exception as e:
+            print(f"Error in connect: {str(e)}")
+            raise
+        finally:
+            db.close()
+
+    async def disconnect(self, user_id: str, event_id: str):
+        try:
+            if user_id in self.active_connections:
+                del self.active_connections[user_id]
+
+            if event_id in self.event_participants:
+                self.event_participants[event_id].remove(user_id)
+                print(f"User {user_id} removed from {event_id}")  # Debug line
+
+                # Notify others about disconnect
+                await self.broadcast_to_event(
+                    event_id, {"type": "node_left", "data": {"user_id": user_id}}
+                )
+        except Exception as e:
+            print(f"Error in disconnect: {str(e)}")  # Debug line
+
+    async def broadcast_to_event(self, event_id: str, message: dict):
+        try:
+            if event_id in self.event_participants:
+                print(f"Broadcasting to event {event_id}: {message}")  # Debug line
+                for user_id in self.event_participants[event_id]:
+                    if user_id in self.active_connections:
+                        await self.active_connections[user_id].send_json(message)
+                        print(f"Message sent to user {user_id}")  # Debug line
+        except Exception as e:
+            print(f"Error in broadcast: {str(e)}")  # Debug line
+
+
+
+=== File: schemas/schemas.py ===
+
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional, Dict
+
+
+# User schemas
+class UserBase(BaseModel):
+    name: str
+    email: str
+    role: str
+    profile: Dict
+
+
+class UserCreate(UserBase):
+    pass
+
+
+class User(UserBase):
+    id: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# Event schemas
+class EventBase(BaseModel):
+    name: str
+    start_date: datetime
+    end_date: datetime
+    status: str
+
+
+class EventCreate(EventBase):
+    pass
+
+
+class Event(EventBase):
+    id: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# Event Participant schemas
+class EventParticipantBase(BaseModel):
+    event_id: str
+    user_id: str
+    role: str
+
+
+class EventParticipantCreate(EventParticipantBase):
+    pass
+
+
+class EventParticipant(EventParticipantBase):
+    id: int
+    joined_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# Connection schemas
+class ConnectionBase(BaseModel):
+    user_id_1: str
+    user_id_2: str
+    event_id: str
+    status: str
+
+
+class ConnectionCreate(ConnectionBase):
+    pass
+
+
+class Connection(ConnectionBase):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+=== File: schemas/__init__.py ===
+
