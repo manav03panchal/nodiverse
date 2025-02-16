@@ -100,7 +100,7 @@ def main():
     all_users = []
 
     # Create 45 participants
-    for i in range(45):
+    for i in range(2):
         name = random.choice(NAMES) + str(random.randint(1, 99))  # Ensure uniqueness
         user_id = create_user(name, "participant")
         if user_id:
